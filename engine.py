@@ -1,0 +1,857 @@
+"""海量文件迁移引擎（后端核心）。
+
+设计要点（面向百万级文件）：
+- 扫描阶段流式统计文件数 / 总大小，不在内存中保留文件清单，内存占用恒定。
+- 拷贝阶段使用「有界队列 + 固定线程数」的生产者/消费者模型，避免一次性提交海量任务。
+- 写入使用 ``*.part`` 临时文件 + 原子替换，任务中断/取消不会留下半截目标文件。
+- 增量模式：目标文件大小与 mtime 一致则跳过。
+- 校验阶段：先比对目录结构（文件数 / 总大小 / 软链接数），再对同名文件做 MD5 比对。
+- 支持暂停 / 恢复 / 取消 / 限速（MB/s）；速度采用滑动窗口统计。
+"""
+
+from __future__ import annotations
+
+import atexit
+import glob
+import hashlib
+import json
+import os
+import queue
+import threading
+import time
+import uuid
+from collections import deque
+
+CHUNK = 4 * 1024 * 1024  # 单次读写块大小，兼顾大文件吞吐与小文件延迟
+MTIME_TOLERANCE = 1.0
+SAMPLE_WINDOW = 3.0  # 速度统计窗口（秒）
+LONG_PREFIX = "\\\\?\\"
+
+# ---- 持久化相关 ----
+PERSIST_DEBOUNCE = 0.35    # 毫秒级事件合并写盘
+PERSIST_LOG_MAX_BYTES = 1 * 1024 * 1024   # 单份日志文件上限
+SCHEMA_VERSION = 1
+
+DEFAULT_OPTIONS = {
+    "threads": 4,          # 并发拷贝线程数
+    "verify": True,        # 是否在拷贝后做哈希校验
+    "incremental": True,   # 增量模式（大小 + mtime 一致则跳过）
+    "rate_limit_mb": 0,    # 单任务限速，0 表示不限速
+    "preserve_mtime": True,
+    "follow_symlinks": False,
+    "overwrite": True,
+}
+
+
+# --------------------------------------------------------------------------- #
+# 工具函数
+# --------------------------------------------------------------------------- #
+def longpath(path: str) -> str:
+    r"""Windows 下为超长路径加 \\?\ 前缀，避免 260 字符限制。"""
+    path = os.path.abspath(path)
+    if os.name != "nt" or path.startswith(LONG_PREFIX):
+        return path
+    if len(path) < 240:
+        return path
+    if path.startswith("\\\\"):
+        return LONG_PREFIX + "UNC\\" + path[2:]
+    return LONG_PREFIX + path
+
+
+def human_size(num: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(num) < 1024 or unit == "PB":
+            return f"{num:.2f} {unit}" if unit != "B" else f"{int(num)} B"
+        num /= 1024.0
+    return f"{num:.2f} PB"
+
+
+def human_speed(bps: float) -> str:
+    v = human_size(bps)
+    return v + "/s"
+
+
+def makedirs(path: str) -> None:
+    os.makedirs(longpath(path), exist_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# 限速器（令牌桶，多线程共享）
+# --------------------------------------------------------------------------- #
+class RateLimiter:
+    def __init__(self, mbps: float = 0) -> None:
+        self.rate = max(0.0, mbps) * 1024 * 1024
+        self.allowance = self.rate
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def consume(self, nbytes: int) -> None:
+        """令牌桶：保证长期平均速率不超过 rate，保留欠额不重置。"""
+        if self.rate <= 0:
+            return
+        remaining = nbytes
+        while remaining > 0:
+            take = min(remaining, self.rate)
+            while True:
+                with self.lock:
+                    now = time.monotonic()
+                    self.allowance = min(self.rate, self.allowance + (now - self.last) * self.rate)
+                    self.last = now
+                    if self.allowance >= take:
+                        self.allowance -= take
+                        break
+                    wait = (take - self.allowance) / self.rate
+                time.sleep(min(wait, 0.5))
+            remaining -= take
+
+
+# --------------------------------------------------------------------------- #
+# 任务
+# --------------------------------------------------------------------------- #
+class Task:
+    def __init__(self, seq: int, name: str, source: str, dest: str, options: dict | None = None):
+        self.id = uuid.uuid4().hex[:10]
+        self.seq = seq
+        self.name = name or os.path.basename(source.rstrip("/\\")) or source
+        self.source = os.path.abspath(source)
+        self.dest = os.path.abspath(dest)
+        self.options = {**DEFAULT_OPTIONS, **(options or {})}
+        self.status = "pending"
+        self.created = time.time()
+        self.started: float | None = None
+        self.finished: float | None = None
+        self.files_total = 0
+        self.files_done = 0
+        self.files_skipped = 0
+        self.files_failed = 0
+        self.bytes_total = 0
+        self.bytes_done = 0
+        self.verify_total = 0
+        self.verify_done = 0
+        self.md5_mismatch = 0
+        self.current = ""
+        self.message = ""
+        self.source_links = 0
+        self.dest_links = 0
+        self._samples: deque = deque(maxlen=256)
+        self._pause = threading.Event()
+        self._pause.set()  # set = 可运行
+        self._cancel = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self.limiter = RateLimiter(self.options["rate_limit_mb"])
+
+    # -- 状态控制 ---------------------------------------------------------- #
+    def add_bytes(self, n: int) -> None:
+        with self._lock:
+            self.bytes_done += n
+
+    def gate(self) -> bool:
+        """暂停时阻塞；返回 False 表示任务已取消。"""
+        while not self._pause.wait(0.2):
+            if self._cancel.is_set():
+                return False
+        return not self._cancel.is_set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def pause(self) -> None:
+        if self.status in ("scanning", "running", "verifying"):
+            self._pause.clear()
+            self.status = "paused"
+
+    def resume(self) -> None:
+        if self.status == "paused":
+            self._pause.set()
+            self.status = "running"
+
+    def cancel(self) -> None:
+        self._cancel.set()
+        self._pause.set()
+
+    # -- 统计 -------------------------------------------------------------- #
+    def speed(self) -> float:
+        now = time.time()
+        samples = [s for s in self._samples if now - s[0] <= SAMPLE_WINDOW]
+        if len(samples) < 2:
+            return 0.0
+        t0, b0 = samples[0]
+        t1, b1 = samples[-1]
+        if t1 - t0 <= 0:
+            return 0.0
+        return max(0.0, (b1 - b0) / (t1 - t0))
+
+    def snapshot(self) -> dict:
+        if self.status == "done":
+            percent = 100.0
+        elif self.bytes_total > 0:
+            percent = min(100.0, self.bytes_done / self.bytes_total * 100)
+        elif self.files_total:
+            percent = self.files_done / self.files_total * 100
+        else:
+            percent = 0.0
+        speed = self.speed()
+        eta = -1.0
+        if speed > 0 and self.bytes_total > self.bytes_done:
+            eta = (self.bytes_total - self.bytes_done) / speed
+        return {
+            "id": self.id,
+            "seq": self.seq,
+            "name": self.name,
+            "source": self.source,
+            "dest": self.dest,
+            "status": self.status,
+            "percent": round(percent, 2),
+            "files_total": self.files_total,
+            "files_done": self.files_done,
+            "files_skipped": self.files_skipped,
+            "files_failed": self.files_failed,
+            "bytes_total": self.bytes_total,
+            "bytes_done": self.bytes_done,
+            "bytes_total_text": human_size(self.bytes_total),
+            "bytes_done_text": human_size(self.bytes_done),
+            "speed": speed,
+            "speed_text": human_speed(speed) if speed > 0 else "0 MB/s",
+            "eta": eta,
+            "current": self.current,
+            "message": self.message,
+            "verify_total": self.verify_total,
+            "verify_done": self.verify_done,
+            "md5_mismatch": self.md5_mismatch,
+            "options": self.options,
+            "elapsed": (self.finished or time.time()) - (self.started or time.time()),
+        }
+
+    # -- 持久化 ------------------------------------------------------------ #
+    def to_persist(self) -> dict:
+        """只导出可序列化字段，排除线程事件等运行态。"""
+        return {
+            "id": self.id,
+            "seq": self.seq,
+            "name": self.name,
+            "source": self.source,
+            "dest": self.dest,
+            "status": self.status,
+            "options": self.options,
+            "created": self.created,
+            "started": self.started,
+            "finished": self.finished,
+            "files_total": self.files_total,
+            "files_done": self.files_done,
+            "files_skipped": self.files_skipped,
+            "files_failed": self.files_failed,
+            "bytes_total": self.bytes_total,
+            "bytes_done": self.bytes_done,
+            "verify_total": self.verify_total,
+            "verify_done": self.verify_done,
+            "md5_mismatch": self.md5_mismatch,
+            "current": self.current,
+            "message": self.message,
+            "source_links": self.source_links,
+            "dest_links": self.dest_links,
+        }
+
+    @classmethod
+    def from_persist(cls, data: dict) -> "Task":
+        """从持久化快照重建 Task。恢复 running/scanning/verifying → interrupted。"""
+        t = cls.__new__(cls)
+        restored_fields = {
+            "id", "seq", "name", "source", "dest", "status", "options",
+            "created", "started", "finished",
+            "files_total", "files_done", "files_skipped", "files_failed",
+            "bytes_total", "bytes_done", "verify_total", "verify_done",
+            "md5_mismatch", "current", "message", "source_links", "dest_links",
+        }
+        for k in restored_fields:
+            setattr(t, k, data.get(k))
+        if t.options is None:
+            t.options = {**DEFAULT_OPTIONS}
+        t._samples = deque(maxlen=256)
+        t._pause = threading.Event()
+        t._pause.set()
+        t._cancel = threading.Event()
+        t._lock = threading.Lock()
+        t._thread = None
+        t.limiter = RateLimiter(t.options.get("rate_limit_mb", 0))
+        # 进程中断的任务（上次退出前仍在跑），统一标记为 interrupted + 暂停
+        if t.status in ("scanning", "running", "verifying"):
+            t.status = "interrupted"
+            t._pause.clear()  # 保持暂停，等用户点击继续/重试
+        return t
+
+
+# --------------------------------------------------------------------------- #
+# 存储层：COW 原子写 + 追加式日志 + 重启恢复
+# --------------------------------------------------------------------------- #
+class Storage:
+    def __init__(self, data_dir: str) -> None:
+        self.dir = os.path.abspath(data_dir)
+        makedirs(self.dir)
+        self.tasks_file = os.path.join(self.dir, "tasks.json")
+        self.logs_file = os.path.join(self.dir, "logs.jsonl")
+        self._log_file = open(self.logs_file, "a", encoding="utf-8", buffering=1)
+        self._rotate_logs_if_needed()
+
+    # -- COW 原子写 ------------------------------------------------------- #
+    def _atomic_write_json(self, path: str, payload: dict) -> None:
+        """写 .tmp → rename 覆盖 → 清理 .bak；进程崩溃最多留下 .tmp，不会损坏主文件。"""
+        data = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        tmp = path + ".tmp"
+        bak = path + ".bak"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+        if os.path.exists(longpath(path)):
+            try:
+                os.replace(longpath(path), longpath(bak))
+            except OSError:
+                pass
+        os.replace(longpath(tmp), longpath(path))
+        try:
+            os.unlink(longpath(bak))
+        except OSError:
+            pass
+
+    def save_tasks(self, tasks: list[Task], next_seq: int) -> None:
+        payload = {
+            "version": SCHEMA_VERSION,
+            "saved_at": time.time(),
+            "next_seq": next_seq,
+            "tasks": [t.to_persist() for t in tasks],
+        }
+        self._atomic_write_json(self.tasks_file, payload)
+
+    def load_tasks(self) -> tuple[list[dict], int]:
+        if not os.path.exists(longpath(self.tasks_file)):
+            return [], 0
+        for candidate in (self.tasks_file, self.tasks_file + ".bak"):
+            try:
+                with open(longpath(candidate), "r", encoding="utf-8") as f:
+                    raw = f.read()
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                if data.get("version", 0) != SCHEMA_VERSION:
+                    continue
+                return data.get("tasks", []), int(data.get("next_seq", 0))
+            except (OSError, json.JSONDecodeError):
+                continue
+        return [], 0
+
+    # -- 追加式日志 ------------------------------------------------------- #
+    def append_log(self, rec: dict) -> None:
+        try:
+            self._log_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._log_file.flush()
+            self._rotate_logs_if_needed()
+        except OSError:
+            pass
+
+    def _rotate_logs_if_needed(self) -> None:
+        try:
+            size = os.path.getsize(longpath(self.logs_file))
+        except OSError:
+            return
+        if size < PERSIST_LOG_MAX_BYTES:
+            return
+        self._log_file.close()
+        rotate = self.logs_file + ".1"
+        if os.path.exists(longpath(rotate)):
+            os.unlink(longpath(rotate))
+        os.replace(longpath(self.logs_file), longpath(rotate))
+        self._log_file = open(self.logs_file, "a", encoding="utf-8", buffering=1)
+
+    def close(self) -> None:
+        try:
+            self._log_file.flush()
+            self._log_file.close()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# 引擎
+# --------------------------------------------------------------------------- #
+class Engine:
+    def __init__(self, max_logs: int = 4000, storage_dir: str | None = None) -> None:
+        # 默认存储目录：与 engine.py 同目录下 .fsync_data
+        if storage_dir is None:
+            storage_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".fsync_data")
+        self.storage = Storage(storage_dir)
+
+        self.tasks: dict[str, Task] = {}
+        self.order: list[str] = []
+        self.logs: deque = deque(maxlen=max_logs)
+        self.log_seq = 0
+        self._seq = 0
+        self._lock = threading.Lock()
+        self._persist_lock = threading.Lock()
+        self._persist_timer: threading.Timer | None = None
+        self._persist_pending = False
+
+        # 先还原持久化的任务，再启动监控线程
+        self._revive()
+
+        self._monitor = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor.start()
+
+        atexit.register(self.flush)
+
+    # -- 日志 -------------------------------------------------------------- #
+    def log(self, level: str, message: str, task: Task | None = None) -> None:
+        with self._lock:
+            self.log_seq += 1
+            rec = {
+                "seq": self.log_seq,
+                "ts": time.time(),
+                "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                "level": level,
+                "task_id": task.id if task else "",
+                "task_seq": task.seq if task else 0,
+                "message": message,
+            }
+            self.logs.append(rec)
+        # 追加到磁盘（不加锁，IO 在 Storage 内部自己兜底）
+        try:
+            self.storage.append_log(rec)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def logs_since(self, seq: int, task_id: str = "", level: str = "", limit: int = 500) -> list[dict]:
+        out = []
+        for rec in self.logs:
+            if rec["seq"] <= seq:
+                continue
+            if task_id and rec["task_id"] != task_id:
+                continue
+            if level and level != "ALL" and rec["level"] != level:
+                continue
+            out.append(rec)
+        return out[-limit:]
+
+    # -- 恢复 / 持久化 ---------------------------------------------------- #
+    def _revive(self) -> None:
+        """启动时从 tasks.json 还原任务。running/scanning/verifying → interrupted(暂停)。"""
+        rows, seq = self.storage.load_tasks()
+        self._seq = seq
+        revived = 0
+        for data in rows:
+            try:
+                task = Task.from_persist(data)
+                self.tasks[task.id] = task
+                self.order.append(task.id)
+                revived += 1
+            except Exception as exc:  # noqa: BLE001
+                self.log("WARN", f"忽略损坏的持久化任务: {exc}")
+        if revived:
+            interrupted = [t.name for t in self.tasks.values() if t.status == "interrupted"]
+            if interrupted:
+                self.log("WARN",
+                         f"启动恢复 {revived} 个任务，其中 {len(interrupted)} 个因上次进程中断被标记为 interrupted："
+                         + ", ".join(interrupted[:5])
+                         + ("..." if len(interrupted) > 5 else ""))
+            else:
+                self.log("INFO", f"启动恢复 {revived} 个已结束任务")
+        # 落一份"已恢复"快照，防止 interrupted 状态被重复叠加
+        self._persist_now()
+
+    def _schedule_persist(self) -> None:
+        """合并写盘：300ms 内多次调用 → 只写一次。"""
+        with self._persist_lock:
+            if self._persist_pending:
+                return
+            self._persist_pending = True
+            self._persist_timer = threading.Timer(PERSIST_DEBOUNCE, self._persist_now)
+            self._persist_timer.daemon = True
+            self._persist_timer.start()
+
+    def _persist_now(self) -> None:
+        """立即写盘（COW 原子），供定时器与紧急路径调用。"""
+        with self._persist_lock:
+            if self._persist_timer:
+                self._persist_timer.cancel()
+                self._persist_timer = None
+            self._persist_pending = False
+        try:
+            with self._lock:
+                snapshot = [self.tasks[tid] for tid in self.order if tid in self.tasks]
+                seq = self._seq
+            self.storage.save_tasks(snapshot, seq)
+        except Exception as exc:  # noqa: BLE001
+            self.log("ERROR", f"持久化失败: {exc}")
+
+    def flush(self) -> None:
+        """进程退出前 / 生命周期关闭时调用，保证最后一次状态落盘。"""
+        try:
+            self._persist_now()
+            self.storage.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- 任务管理 ---------------------------------------------------------- #
+    def create(self, name: str, source: str, dest: str, options: dict | None = None) -> Task:
+        with self._lock:
+            self._seq += 1
+            task = Task(self._seq, name, source, dest, options)
+            self.tasks[task.id] = task
+            self.order.append(task.id)
+        self.log("INFO", f"新建任务: {task.source} → {task.dest}", task)
+        self._persist_now()  # 新任务立即落盘
+        self.start(task)
+        return task
+
+    def start(self, task: Task) -> None:
+        if task._thread and task._thread.is_alive():
+            return
+        task._cancel.clear()
+        task._pause.set()
+        task.started = task.started or time.time()
+        task.finished = None
+        task.status = "scanning"
+        task._thread = threading.Thread(target=self._run, args=(task,), daemon=True)
+        task._thread.start()
+        self._schedule_persist()
+
+    def pause(self, task: Task) -> None:
+        task.pause()
+        self._schedule_persist()
+
+    def resume(self, task: Task) -> None:
+        task.resume()
+        self._schedule_persist()
+
+    def cancel(self, task: Task) -> None:
+        task.cancel()
+        self._schedule_persist()
+
+    def retry(self, task: Task) -> None:
+        task.bytes_done = 0
+        task.files_done = 0
+        task.files_skipped = 0
+        task.files_failed = 0
+        task.verify_done = 0
+        task.md5_mismatch = 0
+        task.started = None
+        task.finished = None
+        self.start(task)
+
+    def remove(self, task_id: str) -> None:
+        task = self.tasks.pop(task_id, None)
+        if task:
+            task.cancel()
+            if task_id in self.order:
+                self.order.remove(task_id)
+            self.log("WARN", f"删除任务: {task.name}", task)
+            self._persist_now()  # 删除立即落盘
+
+    def snapshot(self) -> list[dict]:
+        return [self.tasks[tid].snapshot() for tid in self.order if tid in self.tasks]
+
+    def aggregate(self) -> dict:
+        snap = self.snapshot()
+        running = [t for t in snap if t["status"] in ("scanning", "running", "verifying")]
+        return {
+            "total": len(snap),
+            "running": len(running),
+            "done": len([t for t in snap if t["status"] == "done"]),
+            "speed": sum(t["speed"] for t in running),
+            "bytes_total": sum(t["bytes_total"] for t in snap),
+            "bytes_done": sum(t["bytes_done"] for t in snap),
+        }
+
+    # -- 统计采样 + 定期持久化 --------------------------------------------- #
+    def _monitor_loop(self) -> None:
+        while True:
+            time.sleep(0.5)
+            now = time.time()
+            any_active = False
+            for task in list(self.tasks.values()):
+                if task.status in ("scanning", "running", "verifying"):
+                    any_active = True
+                    task._samples.append((now, task.bytes_done))
+                elif len(task._samples) > 1:
+                    task._samples.popleft()
+            # 活跃任务：每 ~2s 合并落盘一次进度
+            if any_active and not self._persist_pending:
+                self._schedule_persist()
+
+    # -- 主流程 ------------------------------------------------------------ #
+    def _run(self, task: Task) -> None:
+        try:
+            self.log("INFO", f"校准任务启动: {task.source} → {task.dest}", task)
+            self.log("INFO", f"源目录: {task.source}", task)
+            self.log("INFO", f"目标目录: {task.dest}", task)
+
+            # 1) 扫描
+            task.status = "scanning"
+            self._schedule_persist()
+            files, total, links = self._scan(task, task.source)
+            task.files_total = files
+            task.bytes_total = total
+            task.source_links = links
+            self.log("INFO", f"扫描完成: 文件数 {files} vs 总大小 {human_size(total)}", task)
+            self._schedule_persist()
+            if task.options["incremental"]:
+                self.log("INFO", "增量模式 mtime 校验: 大小 + mtime 一致则跳过", task)
+            if task.cancelled:
+                task.status = "cancelled"
+                task.finished = time.time()
+                self.log("WARN", "任务已取消", task)
+                return
+            while task.status == "paused" and not task.cancelled:
+                time.sleep(0.2)
+
+            makedirs(task.dest)
+
+            # 2) 拷贝
+            task.status = "running"
+            self._schedule_persist()
+            self._copy_tree(task)
+            if task.cancelled:
+                task.status = "cancelled"
+                task.finished = time.time()
+                self.log("WARN", f"任务已取消: 已处理 {task.files_done}/{task.files_total} 个文件", task)
+                return
+
+            # 3) 校验
+            if task.options["verify"]:
+                task.status = "verifying"
+                self._schedule_persist()
+                self._verify(task)
+
+            task.files_total = task.files_total or task.files_done
+            task.bytes_total = task.bytes_total or task.bytes_done
+            ok = not task.files_failed and not task.md5_mismatch
+            task.status = "done" if ok else "failed"
+            task.finished = time.time()
+            task.current = ""
+            self.log(
+                "SUCCESS" if task.status == "done" else "ERROR",
+                f"任务结束: 文件 {task.files_done} 成功 / {task.files_skipped} 跳过 / "
+                f"{task.files_failed} 失败，耗时 {task.finished - (task.started or task.finished):.1f}s",
+                task,
+            )
+        except Exception as exc:  # noqa: BLE001
+            task.status = "failed"
+            task.finished = time.time()
+            task.message = str(exc)
+            self.log("ERROR", f"任务异常: {exc}", task)
+        finally:
+            # 终端状态一律立即落盘，保证重启后可恢复
+            if task.status in ("done", "failed", "cancelled"):
+                self._persist_now()
+
+    # -- 扫描 -------------------------------------------------------------- #
+    def _scan(self, task: Task, root: str) -> tuple[int, int, int]:
+        files = 0
+        total = 0
+        links = 0
+        stack = [root]
+        while stack:
+            if task.cancelled:
+                return files, total, links
+            cur = stack.pop()
+            try:
+                with os.scandir(longpath(cur)) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_symlink():
+                                links += 1
+                                if not task.options["follow_symlinks"]:
+                                    continue
+                            if entry.is_dir(follow_symlinks=task.options["follow_symlinks"]):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=task.options["follow_symlinks"]):
+                                files += 1
+                                total += entry.stat().st_size
+                        except OSError:
+                            continue
+                        if files % 20000 == 0 and files:
+                            task.message = f"已统计 {files} 个文件 / {human_size(total)}"
+            except OSError as exc:
+                self.log("ERROR", f"扫描失败 {cur}: {exc}", task)
+        return files, total, links
+
+    def _walk_files(self, root: str):
+        """流式产出 (绝对路径, 相对路径)，不保留清单。"""
+        stack = [root]
+        while stack:
+            cur = stack.pop()
+            try:
+                with os.scandir(longpath(cur)) as it:
+                    for entry in it:
+                        try:
+                            if entry.is_symlink():
+                                continue
+                            if entry.is_dir():
+                                stack.append(entry.path)
+                            elif entry.is_file():
+                                rel = os.path.relpath(entry.path, root)
+                                yield entry.path, rel
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+
+    # -- 拷贝 -------------------------------------------------------------- #
+    def _copy_tree(self, task: Task) -> None:
+        workers = max(1, int(task.options["threads"]))
+        q: queue.Queue = queue.Queue(maxsize=workers * 16)
+
+        def worker() -> None:
+            while True:
+                item = q.get()
+                try:
+                    if item is None:
+                        return
+                    self._copy_one(task, item[0], item[1])
+                finally:
+                    q.task_done()
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+        for t in threads:
+            t.start()
+
+        try:
+            for src, rel in self._walk_files(task.source):
+                if task.cancelled:
+                    break
+                if not task.gate():
+                    break
+                q.put((src, rel))
+        finally:
+            for _ in threads:
+                q.put(None)
+            for t in threads:
+                t.join()
+
+    def _copy_one(self, task: Task, src: str, rel: str) -> None:
+        if task.cancelled or not task.gate():
+            return
+        dst = os.path.join(task.dest, rel)
+        tmp = dst + ".part"
+        try:
+            st = os.stat(longpath(src))
+            if task.options["incremental"]:
+                try:
+                    dt = os.stat(longpath(dst))
+                    if dt.st_size == st.st_size and abs(dt.st_mtime - st.st_mtime) <= MTIME_TOLERANCE:
+                        task.files_skipped += 1
+                        task.files_done += 1
+                        task.add_bytes(st.st_size)
+                        return
+                except OSError:
+                    pass
+            if not task.options["overwrite"] and os.path.exists(longpath(dst)):
+                task.files_skipped += 1
+                task.files_done += 1
+                return
+
+            makedirs(os.path.dirname(dst) or task.dest)
+            task.current = rel
+            written = 0
+            with open(longpath(src), "rb", buffering=0) as fin, open(longpath(tmp), "wb", buffering=0) as fout:
+                while True:
+                    if task.cancelled:
+                        break
+                    if not task.gate():
+                        break
+                    chunk = fin.read(CHUNK)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    task.limiter.consume(len(chunk))
+                    written += len(chunk)
+                    task.add_bytes(len(chunk))
+                if task.cancelled or not task._pause.is_set():
+                    fout.close()
+                    self._safe_unlink(tmp)
+                    return
+            os.replace(longpath(tmp), longpath(dst))
+            if task.options["preserve_mtime"]:
+                os.utime(longpath(dst), (st.st_atime, st.st_mtime))
+            task.files_done += 1
+            if written != st.st_size:
+                task.files_failed += 1
+                self.log("WARN", f"大小不一致: {rel} 源 {st.st_size} vs 写入 {written}", task)
+        except PermissionError as exc:
+            task.files_failed += 1
+            task.files_done += 1
+            self.log("ERROR", f"访问被拒绝: {rel} ({exc})", task)
+            self._safe_unlink(tmp)
+        except OSError as exc:
+            task.files_failed += 1
+            task.files_done += 1
+            self.log("ERROR", f"拷贝失败: {rel} ({exc})", task)
+            self._safe_unlink(tmp)
+
+    @staticmethod
+    def _safe_unlink(path: str) -> None:
+        try:
+            os.unlink(longpath(path))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _md5(path: str) -> str:
+        h = hashlib.md5()
+        with open(longpath(path), "rb", buffering=0) as f:
+            while True:
+                chunk = f.read(CHUNK)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
+    # -- 校验 -------------------------------------------------------------- #
+    def _verify(self, task: Task) -> None:
+        self.log("INFO", "校验结果:", task)
+        d_files, d_total, d_links = self._scan(task, task.dest)
+        task.dest_links = d_links
+        self.log("INFO", f"文件数: 源 {task.files_total} vs 目标 {d_files} "
+                         f"{'一致' if d_files >= task.files_total else '不一致'}", task)
+        self.log("INFO", f"总大小: 源 {human_size(task.bytes_total)} vs 目标 {human_size(d_total)} "
+                         f"{'一致' if d_total >= task.bytes_total else '不一致'}", task)
+        self.log("INFO", f"软链接数: 源 {task.source_links} vs 目标 {d_links} "
+                         f"{'一致' if task.source_links == d_links else '不一致'}", task)
+        self.log("INFO", "开始哈希校验（同名文件）...", task)
+
+        task.verify_total = task.files_total
+        task.verify_done = 0
+        mismatches = 0
+        root_src, root_dst = task.source, task.dest
+        for src, rel in self._walk_files(root_src):
+            if task.cancelled:
+                return
+            if not task.gate():
+                return
+            dst = os.path.join(root_dst, rel)
+            task.current = rel
+            try:
+                if not os.path.exists(longpath(dst)):
+                    mismatches += 1
+                    self.log("ERROR", f"目标缺失: {rel}", task)
+                    continue
+                if os.stat(longpath(src)).st_size != os.stat(longpath(dst)).st_size:
+                    mismatches += 1
+                    self.log("ERROR", f"大小不一致: {rel}", task)
+                    continue
+                if self._md5(src) != self._md5(dst):
+                    mismatches += 1
+                    self.log("ERROR", f"MD5 不一致: {rel}", task)
+                task.add_bytes(0)
+            except OSError as exc:
+                mismatches += 1
+                self.log("ERROR", f"校验失败: {rel} ({exc})", task)
+            finally:
+                task.verify_done += 1
+        task.md5_mismatch = mismatches
+        task.current = ""
+        if mismatches:
+            self.log("ERROR", f"哈希校验完成: {mismatches} 个文件不一致", task)
+        else:
+            self.log("SUCCESS", f"哈希校验完成: {task.verify_done} 个文件全部一致", task)
+
+
+engine = Engine()

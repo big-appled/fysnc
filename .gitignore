@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# FastAPI server runtime
+server.out.log
+server.err.log
+
+# 运行时数据（任务快照、日志、临时文件）
+.fsync_data/
+*.fsync_data/
+*.tmp
+*.bak
+
+# 测试目录（临时生成的大文件树）
+_test/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.jpg

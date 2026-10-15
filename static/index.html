@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>智能文件迁移</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-logo">⇄</span>
+      <span class="brand-name">智能文件迁移</span>
+      <span class="badge-limit">IP 限制</span>
+    </div>
+    <div class="topstats">
+      <div class="stat"><span class="stat-dot cyan"></span>运行中任务 <b id="stat-running">0</b></div>
+      <div class="stat"><span class="stat-dot green"></span>已完成 <b id="stat-done">0</b></div>
+      <div class="stat"><span class="stat-dot blue"></span>总速度 <b id="stat-speed">0 MB/s</b></div>
+      <div class="conn" id="conn"><span class="conn-dot"></span><span id="conn-text">连接中…</span></div>
+    </div>
+  </header>
+
+  <div class="body">
+    <!-- 左侧任务列表 -->
+    <aside class="sidebar panel">
+      <div class="panel-head">
+        <h2>任务列表</h2>
+        <button class="btn btn-primary" id="btn-new">＋ 新建任务</button>
+      </div>
+      <div class="side-tools">
+        <div class="search">
+          <span class="search-ico">⌕</span>
+          <input id="task-search" placeholder="搜索任务…" />
+        </div>
+        <div class="bulk">
+          <label class="chk"><input type="checkbox" id="select-all" /><span>全选</span></label>
+          <div class="bulk-actions">
+            <button class="icon-btn" id="bulk-start" title="开始/继续">▶</button>
+            <button class="icon-btn" id="bulk-pause" title="暂停">⏸</button>
+            <button class="icon-btn danger" id="bulk-delete" title="删除">🗑</button>
+          </div>
+        </div>
+      </div>
+      <div class="task-list" id="task-list">
+        <div class="empty">暂无任务，点击「新建任务」开始迁移</div>
+      </div>
+    </aside>
+
+    <!-- 右侧详情 -->
+    <main class="detail">
+      <div class="path-row">
+        <span class="path-label">源路径:</span>
+        <span class="path-value" id="d-source">--</span>
+      </div>
+      <div class="path-row">
+        <span class="path-label">目标路径:</span>
+        <span class="path-value" id="d-dest">--</span>
+      </div>
+
+      <!-- 进度矩阵 -->
+      <section class="panel matrix">
+        <div class="matrix-head">
+          <h3>进度矩阵</h3>
+        </div>
+        <div class="matrix-speed">
+          <div class="speed-main">
+            <span class="speed-ico">⚡</span>
+            <span class="speed-num" id="d-speed">0 MB/s</span>
+          </div>
+          <div class="speed-eta"><span class="eta-ico">⏱</span>预计剩余 <b id="d-eta">--</b></div>
+          <div class="run-state" id="d-status">未选择任务</div>
+        </div>
+        <div class="progress"><div class="progress-fill" id="d-progress" style="width:0%"></div></div>
+        <div class="matrix-stats">
+          <div class="mcell"><span class="mlabel">文件:</span><b id="d-files">0 / 0</b></div>
+          <div class="mcell"><span class="mlabel">数据:</span><b id="d-bytes">0B / 0B</b></div>
+          <div class="mcell"><span class="mlabel">增量模式:</span><b id="d-incremental">--</b></div>
+          <div class="mcell"><span class="mlabel">校验:</span><b id="d-verify">--</b></div>
+        </div>
+      </section>
+
+      <!-- 系统日志 -->
+      <section class="panel logs">
+        <div class="logs-head">
+          <h3>▸ 系统日志</h3>
+          <div class="logs-tools">
+            <select id="log-filter">
+              <option value="ALL">全部</option>
+              <option value="INFO">INFO</option>
+              <option value="SUCCESS">SUCCESS</option>
+              <option value="WARN">WARN</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+            <div class="search small">
+              <span class="search-ico">⌕</span>
+              <input id="log-search" placeholder="过滤日志…" />
+            </div>
+            <button class="icon-btn" id="log-clear" title="清空显示">⌫</button>
+          </div>
+        </div>
+        <div class="log-list" id="log-list"></div>
+        <div class="log-foot"><span id="log-count">0 / 0 记录</span></div>
+      </section>
+
+      <!-- 底部操作 -->
+      <div class="actions">
+        <button class="btn btn-ghost" id="btn-cancel">取消</button>
+        <button class="btn btn-primary" id="btn-start">开始</button>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- 新建任务弹窗 -->
+<div class="modal-mask" id="modal-mask">
+  <div class="modal">
+    <div class="modal-head"><h3>新建迁移任务</h3><button class="icon-btn" id="modal-close">✕</button></div>
+    <div class="modal-body">
+      <label class="field">
+        <span>任务名称（可选）</span>
+        <input id="in-name" placeholder="默认取源目录名" />
+      </label>
+      <label class="field">
+        <span>源路径</span>
+        <div class="input-group">
+          <input id="in-source" placeholder="例如 D:\data\raw" />
+          <button class="btn btn-ghost" data-browse="in-source">浏览</button>
+        </div>
+      </label>
+      <label class="field">
+        <span>目标路径</span>
+        <div class="input-group">
+          <input id="in-dest" placeholder="例如 E:\backup\raw" />
+          <button class="btn btn-ghost" data-browse="in-dest">浏览</button>
+        </div>
+      </label>
+      <div class="field-row">
+        <label class="field"><span>并发线程</span><input id="in-threads" type="number" min="1" max="32" value="4" /></label>
+        <label class="field"><span>限速 MB/s（0=不限速）</span><input id="in-rate" type="number" min="0" value="0" /></label>
+      </div>
+      <div class="switches">
+        <label class="chk"><input type="checkbox" id="in-incremental" checked /><span>增量模式 (mtime)</span></label>
+        <label class="chk"><input type="checkbox" id="in-verify" checked /><span>MD5 校验</span></label>
+        <label class="chk"><input type="checkbox" id="in-overwrite" checked /><span>覆盖已存在文件</span></label>
+      </div>
+      <div class="modal-err" id="modal-err"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="modal-cancel">取消</button>
+      <button class="btn btn-primary" id="modal-create">创建并开始</button>
+    </div>
+  </div>
+</div>
+
+<!-- 目录选择弹窗 -->
+<div class="modal-mask" id="picker-mask">
+  <div class="modal picker">
+    <div class="modal-head"><h3>选择目录</h3><button class="icon-btn" id="picker-close">✕</button></div>
+    <div class="picker-path" id="picker-path"></div>
+    <div class="picker-list" id="picker-list"></div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" id="picker-cancel">取消</button>
+      <button class="btn btn-primary" id="picker-choose">选择当前目录</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
